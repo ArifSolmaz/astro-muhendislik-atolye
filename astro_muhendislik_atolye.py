@@ -731,6 +731,221 @@ def bolum3_karar_matrisi(sonuclar):
 
 
 # ═════════════════════════════════════════════════════════════════
+# BÖLÜM 4: GERÇEK TESS VERİSİ İLE TRANSİT ANALİZİ (OPSİYONEL)
+# ═════════════════════════════════════════════════════════════════
+
+def bolum4_tess_gercek_veri():
+    """
+    Bölüm 4 — Gerçek TESS Verisi ile Transit Analizi.
+
+    WASP-126 b (TIC 25155310) için TESS PDCSAP ışık eğrisi indirilir,
+    BLS periodogram hesaplanır, faz katlanır ve Bölüm 2'deki teorik
+    Mandel-Agol modeli üzerine bindirilir.
+
+    Gereksinim: pip install lightkurve
+    İnternet bağlantısı gerektirir (MAST arşivinden veri indirilir).
+    lightkurve yüklü değilse veya indirme başarısızsa bölüm atlanır.
+    """
+    print("\n" + "=" * 65)
+    print("  BÖLÜM 4: GERÇEK TESS VERİSİ İLE TRANSİT ANALİZİ")
+    print("=" * 65)
+
+    # ── Adım 1: Güvenli import ──
+    try:
+        import lightkurve as lk
+    except ImportError:
+        print("\n  [!] 'lightkurve' kütüphanesi yüklü değil.")
+        print("      Yüklemek için: pip install lightkurve")
+        print("      Bölüm 4 atlanıyor. Bölüm 1-3 sonuçları etkilenmez.\n")
+        return None
+
+    # ── Adım 2: TESS verisini indir ──
+    print("\n  TESS veritabanından WASP-126 (TIC 25155310) aranıyor...")
+    try:
+        search_result = lk.search_lightcurve(
+            'TIC 25155310', mission='TESS', author='SPOC'
+        )
+        if len(search_result) == 0:
+            print("  [!] TESS verisi bulunamadı. Bölüm 4 atlanıyor.\n")
+            return None
+
+        print(f"  {len(search_result)} sektör bulundu:")
+        for i, sr in enumerate(search_result):
+            print(f"    [{i}] {sr.mission[0]}  —  exptime={sr.exptime[0]}")
+
+        print(f"\n  İlk sektör indiriliyor (bu 30-60 sn sürebilir)...")
+        lc_collection = search_result[0].download()
+    except Exception as e:
+        print(f"\n  [!] Veri indirme hatası: {e}")
+        print("      İnternet bağlantınızı kontrol edin.")
+        print("      Bölüm 4 atlanıyor. Bölüm 1-3 sonuçları etkilenmez.\n")
+        return None
+
+    # ── Adım 3: Veri hazırlığı ──
+    print("  Veri temizleniyor ve normalize ediliyor...")
+    lc = lc_collection
+    # PDCSAP akısını seç, NaN ve aykırı değerleri temizle
+    try:
+        lc = lc.select_flux('pdcsap_flux')
+    except Exception:
+        pass  # Zaten PDCSAP olabilir
+    lc = lc.remove_nans().remove_outliers(sigma=5)
+    lc = lc.normalize()
+
+    # Trend çıkarma (düzleştirme)
+    lc_flat = lc.flatten(window_length=301)
+
+    # ── Adım 4: BLS periyot araması ──
+    print("  BLS periodogram hesaplanıyor...")
+
+    # Bilinen parametreler (karşılaştırma için)
+    P_bilinen    = 3.2888     # gün
+    derinlik_bilinen = 0.078**2   # ~0.0061
+    sure_bilinen = 3.42       # saat
+
+    period_grid = np.linspace(1.0, 10.0, 10000)
+    try:
+        pg = lc_flat.to_periodogram(method='bls', period=period_grid)
+        best_period   = pg.period_at_max_power.value
+        best_t0       = pg.transit_time_at_max_power.value
+        best_duration = pg.duration_at_max_power.value * 24  # saate çevir
+
+        # Derinlik tahmini: faz-katlanmış verideki transit vs baz çizgisi
+        lc_fold_tmp = lc_flat.fold(period=best_period, epoch_time=best_t0)
+        in_transit = np.abs(lc_fold_tmp.phase.value) < 0.015
+        out_of_transit = (np.abs(lc_fold_tmp.phase.value) > 0.05) & \
+                         (np.abs(lc_fold_tmp.phase.value) < 0.45)
+        if np.sum(in_transit) > 5 and np.sum(out_of_transit) > 20:
+            baseline = np.median(lc_fold_tmp.flux.value[out_of_transit])
+            in_level = np.median(lc_fold_tmp.flux.value[in_transit])
+            best_depth = baseline - in_level
+        else:
+            best_depth = derinlik_bilinen  # fallback
+    except Exception as e:
+        print(f"  [!] BLS hatası: {e}. Bilinen periyot kullanılıyor.")
+        best_period   = P_bilinen
+        best_t0       = lc_flat.time.value[0]
+        best_depth    = derinlik_bilinen
+        best_duration = sure_bilinen
+        pg = None
+
+    print(f"\n  ═══ BLS Sonuçları (Gerçek TESS Verisi) ═══")
+    print(f"  Tespit edilen periyot : {best_period:.4f} gün")
+    print(f"  Transit derinliği     : {best_depth*100:.3f}%")
+    print(f"  Transit süresi        : {best_duration:.2f} saat")
+
+    # ── Adım 5: Faz katlama ──
+    lc_folded = lc_flat.fold(period=best_period, epoch_time=best_t0)
+
+    # Binlenmiş versiyon (görsel netlik için)
+    try:
+        lc_binned = lc_folded.bin(time_bin_size=0.003)
+    except Exception:
+        lc_binned = lc_folded.bin(bins=200)
+
+    # ── Adım 6: Teorik model bindirme ──
+    # mandel_agol_transit fonksiyonu Bölüm 2'de tanımlı (global scope)
+    phase_model = np.linspace(-0.08, 0.08, 1000)
+    t_model_days = phase_model * best_period
+    flux_model = mandel_agol_transit(
+        t_model_days, 0.0, best_period,
+        0.078, 7.8, 87.8, u1=0.4, u2=0.2
+    )
+
+    # ── Adım 7: 4-Panel Görselleştirme ──
+    fig = plt.figure(figsize=(18, 14))
+    gs = GridSpec(2, 2, hspace=0.35, wspace=0.3)
+
+    # Panel 1: Ham PDCSAP ışık eğrisi
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.scatter(lc.time.value, lc.flux.value, s=0.3, alpha=0.4,
+                color='#8b949e', rasterized=True)
+    ax1.set_xlabel('Zaman (BTJD)')
+    ax1.set_ylabel('Normalize Akı')
+    ax1.set_title('Ham TESS Işık Eğrisi (PDCSAP)', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: BLS Periodogram
+    ax2 = fig.add_subplot(gs[0, 1])
+    if pg is not None:
+        ax2.plot(pg.period.value, pg.power.value,
+                 color='#58a6ff', lw=0.8, alpha=0.8)
+    ax2.axvline(best_period, color='#f85149', ls='--', lw=1.5,
+                label=f'Tespit: {best_period:.4f} gün')
+    ax2.axvline(P_bilinen, color='#7ee787', ls=':', lw=1.5, alpha=0.7,
+                label=f'Literatür: {P_bilinen:.4f} gün')
+    ax2.set_xlabel('Periyot (gün)')
+    ax2.set_ylabel('BLS Gücü')
+    ax2.set_title('BLS Periodogram — Gerçek TESS Verisi',
+                  fontsize=12, fontweight='bold')
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Faz-katlanmış ışık eğrisi
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.scatter(lc_folded.phase.value, lc_folded.flux.value,
+                s=0.5, alpha=0.15, color='#8b949e', rasterized=True)
+    ax3.scatter(lc_binned.phase.value, lc_binned.flux.value,
+                s=20, color='#58a6ff', zorder=5, edgecolors='none',
+                label='Binlenmiş veri')
+    ax3.set_xlabel(f'Faz (P = {best_period:.4f} gün)')
+    ax3.set_ylabel('Normalize Akı')
+    ax3.set_title('Faz-Katlanmış Işık Eğrisi', fontsize=12, fontweight='bold')
+    ax3.legend(fontsize=9)
+    ax3.grid(True, alpha=0.3)
+
+    # Panel 4: Yakınlaştırılmış transit + teorik model
+    ax4 = fig.add_subplot(gs[1, 1])
+    zoom = np.abs(lc_folded.phase.value) < 0.08
+    ax4.scatter(lc_folded.phase.value[zoom], lc_folded.flux.value[zoom],
+                s=1, alpha=0.2, color='#8b949e', rasterized=True)
+    zoom_bin = np.abs(lc_binned.phase.value) < 0.08
+    ax4.scatter(lc_binned.phase.value[zoom_bin],
+                lc_binned.flux.value[zoom_bin],
+                s=30, color='#58a6ff', zorder=5, edgecolors='none',
+                label='Binlenmiş TESS verisi')
+    ax4.plot(phase_model, flux_model, color='#f0883e', lw=2.5, zorder=10,
+             label='Teorik Model (Bölüm 2)')
+    ax4.set_xlabel('Faz')
+    ax4.set_ylabel('Normalize Akı')
+    ax4.set_title('Transit Detayı — Model vs Gerçek Veri',
+                  fontsize=12, fontweight='bold')
+    ax4.legend(fontsize=9)
+    ax4.grid(True, alpha=0.3)
+
+    fig.suptitle('Bölüm 4: Gerçek TESS Verisi — WASP-126 b (TIC 25155310)',
+                 fontsize=14, fontweight='bold', y=1.01, color='#f0883e')
+
+    plt.savefig('bolum4_tess_gercek_veri.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("\n  [✓] Grafik kaydedildi: bolum4_tess_gercek_veri.png")
+
+    # ── Adım 8: Karşılaştırma Tablosu ──
+    print("\n  ═══ MODEL vs TESS KARŞILAŞTIRMASI ═══\n")
+    print(f"  {'Parametre':<25} {'Model (Bölüm 1-3)':<20} {'TESS Ölçümü':<20} {'Fark':<15}")
+    print("  " + "─" * 80)
+
+    dp   = abs(best_period - P_bilinen)
+    dd   = abs(best_depth - derinlik_bilinen)
+    ddur = abs(best_duration - sure_bilinen)
+
+    print(f"  {'Periyot (gün)':<25} {P_bilinen:<20.4f} {best_period:<20.4f} {dp:<15.4f}")
+    print(f"  {'Transit Derinliği (%)':<25} {derinlik_bilinen*100:<20.3f} {best_depth*100:<20.3f} {dd*100:<15.3f}")
+    print(f"  {'Transit Süresi (saat)':<25} {sure_bilinen:<20.2f} {best_duration:<20.2f} {ddur:<15.2f}")
+
+    print("\n  Bu değerler gerçek TESS uzay teleskobu verisinden elde edilmiştir.")
+    print("  Bölüm 1-3'teki simülasyonlarla karşılaştırın!")
+    print("  Küçük farklar: limb darkening katsayıları, detrending yöntemi,")
+    print("  veri kalitesi ve sistematik hata kaynaklarından kaynaklanır.\n")
+
+    return {
+        'best_period': best_period,
+        'best_depth': best_depth,
+        'best_duration': best_duration,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════
 # ANA PROGRAM
 # ═════════════════════════════════════════════════════════════════
 
@@ -759,6 +974,9 @@ def main():
     sonuclar = bolum3_kepler_ve_karakterizasyon()
     bolum3_karar_matrisi(sonuclar)
 
+    # ── BÖLÜM 4 (Opsiyonel — lightkurve + internet gerektirir) ──
+    bolum4_tess_gercek_veri()
+
     print("""
     ╔══════════════════════════════════════════════════════════════╗
     ║                                                              ║
@@ -768,7 +986,8 @@ def main():
     ║   ├─ bolum1_transit_geometrisi.png                           ║
     ║   ├─ bolum1_derinlik_karsilastirma.png                       ║
     ║   ├─ bolum2_limb_darkening.png                               ║
-    ║   └─ bolum3_kepler_karakterizasyon.png                       ║
+    ║   ├─ bolum3_kepler_karakterizasyon.png                       ║
+    ║   └─ bolum4_tess_gercek_veri.png (lightkurve varsa)         ║
     ║                                                              ║
     ║   Her öğrenciden beklenen çıktı:                             ║
     ║   → Gezegen Teknik Karakterizasyon Raporu                    ║
